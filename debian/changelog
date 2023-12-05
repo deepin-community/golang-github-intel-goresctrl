@@ -1,5 +1,32 @@
-template-repository (1.0-1) unstable; urgency=medium
+golang-github-intel-goresctrl (0.3.0-2) unstable; urgency=medium
+
+  * Add patch to skip test which doesn't work in schroot
+
+ -- Shengjing Zhu <zhsj@debian.org>  Wed, 26 Oct 2022 16:42:50 +0800
+
+golang-github-intel-goresctrl (0.3.0-1) unstable; urgency=medium
+
+  * New upstream release 0.3.0
+  * Update Standards-Version to 4.6.1 (no changes)
+  * Include blockio cgroups packages
+  * Vendor partial k8s resource package
+
+ -- Shengjing Zhu <zhsj@debian.org>  Wed, 26 Oct 2022 12:01:00 +0800
+
+golang-github-intel-goresctrl (0.2.0-3) unstable; urgency=medium
+
+  * Exclude sst pkg which only works on amd64
+
+ -- Shengjing Zhu <zhsj@debian.org>  Wed, 23 Feb 2022 01:50:21 +0800
+
+golang-github-intel-goresctrl (0.2.0-2) unstable; urgency=medium
+
+  * Source-only upload for test migration
+
+ -- Shengjing Zhu <zhsj@debian.org>  Tue, 22 Feb 2022 00:02:52 +0800
+
+golang-github-intel-goresctrl (0.2.0-1) unstable; urgency=medium
 
   * Initial release
 
- -- Tsic404 <liuheng@deepin.org>  Sat, 28 Jan 2023 13:46:49 +0800
+ -- Shengjing Zhu <zhsj@debian.org>  Mon, 21 Feb 2022 01:13:33 +0800
