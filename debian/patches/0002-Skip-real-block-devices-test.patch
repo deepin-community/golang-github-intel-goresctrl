@@ -1,0 +1,27 @@
+From: Shengjing Zhu <zhsj@debian.org>
+Date: Wed, 26 Oct 2022 16:40:08 +0800
+Subject: Skip real block devices test
+
+Not work in schroot.
+
+Forwarded: not-needed
+---
+ pkg/blockio/blockio_test.go | 5 -----
+ 1 file changed, 5 deletions(-)
+
+diff --git a/pkg/blockio/blockio_test.go b/pkg/blockio/blockio_test.go
+index ab6ae93..9747415 100644
+--- a/pkg/blockio/blockio_test.go
++++ b/pkg/blockio/blockio_test.go
+@@ -210,11 +210,6 @@ func TestConfigurableBlockDevices(t *testing.T) {
+ 			expectedErrorCount:      3,
+ 			expectedErrorSubstrings: []string{"\"/proc\" is not a device", "\"/proc/meminfo\" is not a device"},
+ 		},
+-		{
+-			name:            "real block devices",
+-			devWildcards:    devBlockDevs,
+-			expectedMatches: len(devBlockDevs),
+-		},
+ 		{
+ 			name:                    "partition",
+ 			devWildcards:            devPartitions,

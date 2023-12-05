@@ -1,4 +1,7 @@
 #!/usr/bin/make -f
 
+export DH_GOLANG_EXCLUDES := cmd pkg/sst
+export DH_GOLANG_INSTALL_EXTRA := test/data
+
 %:
-	dh $@
+	dh $@ --builddirectory=_build --buildsystem=golang
