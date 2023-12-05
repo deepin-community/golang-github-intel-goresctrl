@@ -1,0 +1,1052 @@
+From: Shengjing Zhu <zhsj@debian.org>
+Date: Wed, 26 Oct 2022 11:58:20 +0800
+Subject: vendor partial k8s resource package
+
+golang-k8s-apimachinery hasn't been packaged.
+
+Forwarded: not-needed
+---
+ pkg/blockio/blockio.go                     |   2 +-
+ pkg/blockio/internal/resource/amount.go    | 134 ++++++++++
+ pkg/blockio/internal/resource/math.go      | 234 ++++++++++++++++++
+ pkg/blockio/internal/resource/quantity.go  | 382 +++++++++++++++++++++++++++++
+ pkg/blockio/internal/resource/scale_int.go |  95 +++++++
+ pkg/blockio/internal/resource/suffix.go    | 143 +++++++++++
+ 6 files changed, 989 insertions(+), 1 deletion(-)
+ create mode 100644 pkg/blockio/internal/resource/amount.go
+ create mode 100644 pkg/blockio/internal/resource/math.go
+ create mode 100644 pkg/blockio/internal/resource/quantity.go
+ create mode 100644 pkg/blockio/internal/resource/scale_int.go
+ create mode 100644 pkg/blockio/internal/resource/suffix.go
+
+diff --git a/pkg/blockio/blockio.go b/pkg/blockio/blockio.go
+index 91a01df..4e7a210 100644
+--- a/pkg/blockio/blockio.go
++++ b/pkg/blockio/blockio.go
+@@ -110,7 +110,7 @@ import (
+ 
+ 	"golang.org/x/sys/unix"
+ 
+-	"k8s.io/apimachinery/pkg/api/resource"
++	"github.com/intel/goresctrl/pkg/blockio/internal/resource"
+ 	"sigs.k8s.io/yaml"
+ 
+ 	"github.com/hashicorp/go-multierror"
+diff --git a/pkg/blockio/internal/resource/amount.go b/pkg/blockio/internal/resource/amount.go
+new file mode 100644
+index 0000000..dfa7b3f
+--- /dev/null
++++ b/pkg/blockio/internal/resource/amount.go
+@@ -0,0 +1,134 @@
++/*
++Copyright 2014 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package resource
++
++import (
++	inf "gopkg.in/inf.v0"
++)
++
++// Scale is used for getting and setting the base-10 scaled value.
++// Base-2 scales are omitted for mathematical simplicity.
++// See Quantity.ScaledValue for more details.
++type Scale int32
++
++// infScale adapts a Scale value to an inf.Scale value.
++func (s Scale) infScale() inf.Scale {
++	return inf.Scale(-s) // inf.Scale is upside-down
++}
++
++const (
++	Nano  Scale = -9
++	Micro Scale = -6
++	Milli Scale = -3
++	Kilo  Scale = 3
++	Mega  Scale = 6
++	Giga  Scale = 9
++	Tera  Scale = 12
++	Peta  Scale = 15
++	Exa   Scale = 18
++)
++
++var (
++	Zero = int64Amount{}
++
++	// Used by quantity strings - treat as read only
++	zeroBytes = []byte("0")
++)
++
++// int64Amount represents a fixed precision numerator and arbitrary scale exponent. It is faster
++// than operations on inf.Dec for values that can be represented as int64.
++// +k8s:openapi-gen=true
++type int64Amount struct {
++	value int64
++	scale Scale
++}
++
++// AsScaledInt64 returns an int64 representing the value of this amount at the specified scale,
++// rounding up, or false if that would result in overflow. (1e20).AsScaledInt64(1) would result
++// in overflow because 1e19 is not representable as an int64. Note that setting a scale larger
++// than the current value may result in loss of precision - i.e. (1e-6).AsScaledInt64(0) would
++// return 1, because 0.000001 is rounded up to 1.
++func (a int64Amount) AsScaledInt64(scale Scale) (result int64, ok bool) {
++	if a.scale < scale {
++		result, _ = negativeScaleInt64(a.value, scale-a.scale)
++		return result, true
++	}
++	return positiveScaleInt64(a.value, a.scale-scale)
++}
++
++// AsDec returns an inf.Dec representation of this value.
++func (a int64Amount) AsDec() *inf.Dec {
++	var base inf.Dec
++	base.SetUnscaled(a.value)
++	base.SetScale(inf.Scale(-a.scale))
++	return &base
++}
++
++// Cmp returns 0 if a and b are equal, 1 if a is greater than b, or -1 if a is less than b.
++func (a int64Amount) Cmp(b int64Amount) int {
++	switch {
++	case a.scale == b.scale:
++		// compare only the unscaled portion
++	case a.scale > b.scale:
++		result, remainder, exact := divideByScaleInt64(b.value, a.scale-b.scale)
++		if !exact {
++			return a.AsDec().Cmp(b.AsDec())
++		}
++		if result == a.value {
++			switch {
++			case remainder == 0:
++				return 0
++			case remainder > 0:
++				return -1
++			default:
++				return 1
++			}
++		}
++		b.value = result
++	default:
++		result, remainder, exact := divideByScaleInt64(a.value, b.scale-a.scale)
++		if !exact {
++			return a.AsDec().Cmp(b.AsDec())
++		}
++		if result == b.value {
++			switch {
++			case remainder == 0:
++				return 0
++			case remainder > 0:
++				return 1
++			default:
++				return -1
++			}
++		}
++		a.value = result
++	}
++
++	switch {
++	case a.value == b.value:
++		return 0
++	case a.value < b.value:
++		return -1
++	default:
++		return 1
++	}
++}
++
++// infDecAmount implements common operations over an inf.Dec that are specific to the quantity
++// representation.
++type infDecAmount struct {
++	*inf.Dec
++}
+diff --git a/pkg/blockio/internal/resource/math.go b/pkg/blockio/internal/resource/math.go
+new file mode 100644
+index 0000000..6986b7e
+--- /dev/null
++++ b/pkg/blockio/internal/resource/math.go
+@@ -0,0 +1,234 @@
++/*
++Copyright 2014 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package resource
++
++import (
++	"math/big"
++
++	inf "gopkg.in/inf.v0"
++)
++
++const (
++	// maxInt64Factors is the highest value that will be checked when removing factors of 10 from an int64.
++	// It is also the maximum decimal digits that can be represented with an int64.
++	maxInt64Factors = 18
++)
++
++var (
++	// Commonly needed big.Int values-- treat as read only!
++	bigTen      = big.NewInt(10)
++	bigZero     = big.NewInt(0)
++	bigOne      = big.NewInt(1)
++	bigThousand = big.NewInt(1000)
++	big1024     = big.NewInt(1024)
++
++	// Commonly needed inf.Dec values-- treat as read only!
++	decZero = inf.NewDec(0, 0)
++	decOne  = inf.NewDec(1, 0)
++
++	// Largest (in magnitude) number allowed.
++	maxAllowed = infDecAmount{inf.NewDec((1<<63)-1, 0)} // == max int64
++)
++
++const mostNegative = -(mostPositive + 1)
++const mostPositive = 1<<63 - 1
++
++// int64Multiply returns a*b, or false if that would overflow or underflow int64.
++func int64Multiply(a, b int64) (int64, bool) {
++	if a == 0 || b == 0 || a == 1 || b == 1 {
++		return a * b, true
++	}
++	if a == mostNegative || b == mostNegative {
++		return 0, false
++	}
++	c := a * b
++	return c, c/b == a
++}
++
++// int64MultiplyScale returns a*b, assuming b is greater than one, or false if that would overflow or underflow int64.
++// Use when b is known to be greater than one.
++func int64MultiplyScale(a int64, b int64) (int64, bool) {
++	if a == 0 || a == 1 {
++		return a * b, true
++	}
++	if a == mostNegative && b != 1 {
++		return 0, false
++	}
++	c := a * b
++	return c, c/b == a
++}
++
++// int64MultiplyScale10 multiplies a by 10, or returns false if that would overflow. This method is faster than
++// int64Multiply(a, 10) because the compiler can optimize constant factor multiplication.
++func int64MultiplyScale10(a int64) (int64, bool) {
++	if a == 0 || a == 1 {
++		return a * 10, true
++	}
++	if a == mostNegative {
++		return 0, false
++	}
++	c := a * 10
++	return c, c/10 == a
++}
++
++// int64MultiplyScale100 multiplies a by 100, or returns false if that would overflow. This method is faster than
++// int64Multiply(a, 100) because the compiler can optimize constant factor multiplication.
++func int64MultiplyScale100(a int64) (int64, bool) {
++	if a == 0 || a == 1 {
++		return a * 100, true
++	}
++	if a == mostNegative {
++		return 0, false
++	}
++	c := a * 100
++	return c, c/100 == a
++}
++
++// int64MultiplyScale1000 multiplies a by 1000, or returns false if that would overflow. This method is faster than
++// int64Multiply(a, 1000) because the compiler can optimize constant factor multiplication.
++func int64MultiplyScale1000(a int64) (int64, bool) {
++	if a == 0 || a == 1 {
++		return a * 1000, true
++	}
++	if a == mostNegative {
++		return 0, false
++	}
++	c := a * 1000
++	return c, c/1000 == a
++}
++
++// positiveScaleInt64 multiplies base by 10^scale, returning false if the
++// value overflows. Passing a negative scale is undefined.
++func positiveScaleInt64(base int64, scale Scale) (int64, bool) {
++	switch scale {
++	case 0:
++		return base, true
++	case 1:
++		return int64MultiplyScale10(base)
++	case 2:
++		return int64MultiplyScale100(base)
++	case 3:
++		return int64MultiplyScale1000(base)
++	case 6:
++		return int64MultiplyScale(base, 1000000)
++	case 9:
++		return int64MultiplyScale(base, 1000000000)
++	default:
++		value := base
++		var ok bool
++		for i := Scale(0); i < scale; i++ {
++			if value, ok = int64MultiplyScale(value, 10); !ok {
++				return 0, false
++			}
++		}
++		return value, true
++	}
++}
++
++// negativeScaleInt64 reduces base by the provided scale, rounding up, until the
++// value is zero or the scale is reached. Passing a negative scale is undefined.
++// The value returned, if not exact, is rounded away from zero.
++func negativeScaleInt64(base int64, scale Scale) (result int64, exact bool) {
++	if scale == 0 {
++		return base, true
++	}
++
++	value := base
++	var fraction bool
++	for i := Scale(0); i < scale; i++ {
++		if !fraction && value%10 != 0 {
++			fraction = true
++		}
++		value = value / 10
++		if value == 0 {
++			if fraction {
++				if base > 0 {
++					return 1, false
++				}
++				return -1, false
++			}
++			return 0, true
++		}
++	}
++	if fraction {
++		if base > 0 {
++			value++
++		} else {
++			value--
++		}
++	}
++	return value, !fraction
++}
++
++func pow10Int64(b int64) int64 {
++	switch b {
++	case 0:
++		return 1
++	case 1:
++		return 10
++	case 2:
++		return 100
++	case 3:
++		return 1000
++	case 4:
++		return 10000
++	case 5:
++		return 100000
++	case 6:
++		return 1000000
++	case 7:
++		return 10000000
++	case 8:
++		return 100000000
++	case 9:
++		return 1000000000
++	case 10:
++		return 10000000000
++	case 11:
++		return 100000000000
++	case 12:
++		return 1000000000000
++	case 13:
++		return 10000000000000
++	case 14:
++		return 100000000000000
++	case 15:
++		return 1000000000000000
++	case 16:
++		return 10000000000000000
++	case 17:
++		return 100000000000000000
++	case 18:
++		return 1000000000000000000
++	default:
++		return 0
++	}
++}
++
++// negativeScaleInt64 returns the result of dividing base by scale * 10 and the remainder, or
++// false if no such division is possible. Dividing by negative scales is undefined.
++func divideByScaleInt64(base int64, scale Scale) (result, remainder int64, exact bool) {
++	if scale == 0 {
++		return base, 0, true
++	}
++	// the max scale representable in base 10 in an int64 is 18 decimal places
++	if scale >= 18 {
++		return 0, base, false
++	}
++	divisor := pow10Int64(int64(scale))
++	return base / divisor, base % divisor, true
++}
+diff --git a/pkg/blockio/internal/resource/quantity.go b/pkg/blockio/internal/resource/quantity.go
+new file mode 100644
+index 0000000..30aa742
+--- /dev/null
++++ b/pkg/blockio/internal/resource/quantity.go
+@@ -0,0 +1,382 @@
++/*
++Copyright 2014 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package resource
++
++import (
++	"errors"
++	"math/big"
++	"strconv"
++	"strings"
++
++	inf "gopkg.in/inf.v0"
++)
++
++// Quantity is a fixed-point representation of a number.
++// It provides convenient marshaling/unmarshaling in JSON and YAML,
++// in addition to String() and AsInt64() accessors.
++//
++// The serialization format is:
++//
++// ```
++// <quantity>        ::= <signedNumber><suffix>
++//
++//	(Note that <suffix> may be empty, from the "" case in <decimalSI>.)
++//
++// <digit>           ::= 0 | 1 | ... | 9
++// <digits>          ::= <digit> | <digit><digits>
++// <number>          ::= <digits> | <digits>.<digits> | <digits>. | .<digits>
++// <sign>            ::= "+" | "-"
++// <signedNumber>    ::= <number> | <sign><number>
++// <suffix>          ::= <binarySI> | <decimalExponent> | <decimalSI>
++// <binarySI>        ::= Ki | Mi | Gi | Ti | Pi | Ei
++//
++//	(International System of units; See: http://physics.nist.gov/cuu/Units/binary.html)
++//
++// <decimalSI>       ::= m | "" | k | M | G | T | P | E
++//
++//	(Note that 1024 = 1Ki but 1000 = 1k; I didn't choose the capitalization.)
++//
++// <decimalExponent> ::= "e" <signedNumber> | "E" <signedNumber>
++// ```
++//
++// No matter which of the three exponent forms is used, no quantity may represent
++// a number greater than 2^63-1 in magnitude, nor may it have more than 3 decimal
++// places. Numbers larger or more precise will be capped or rounded up.
++// (E.g.: 0.1m will rounded up to 1m.)
++// This may be extended in the future if we require larger or smaller quantities.
++//
++// When a Quantity is parsed from a string, it will remember the type of suffix
++// it had, and will use the same type again when it is serialized.
++//
++// Before serializing, Quantity will be put in "canonical form".
++// This means that Exponent/suffix will be adjusted up or down (with a
++// corresponding increase or decrease in Mantissa) such that:
++//
++// - No precision is lost
++// - No fractional digits will be emitted
++// - The exponent (or suffix) is as large as possible.
++//
++// The sign will be omitted unless the number is negative.
++//
++// Examples:
++//
++// - 1.5 will be serialized as "1500m"
++// - 1.5Gi will be serialized as "1536Mi"
++//
++// Note that the quantity will NEVER be internally represented by a
++// floating point number. That is the whole point of this exercise.
++//
++// Non-canonical values will still parse as long as they are well formed,
++// but will be re-emitted in their canonical form. (So always use canonical
++// form, or don't diff.)
++//
++// This format is intended to make it difficult to use these numbers without
++// writing some sort of special handling code in the hopes that that will
++// cause implementors to also use a fixed point implementation.
++//
++// +protobuf=true
++// +protobuf.embed=string
++// +protobuf.options.marshal=false
++// +protobuf.options.(gogoproto.goproto_stringer)=false
++// +k8s:deepcopy-gen=true
++// +k8s:openapi-gen=true
++type Quantity struct {
++	// i is the quantity in int64 scaled form, if d.Dec == nil
++	i int64Amount
++	// d is the quantity in inf.Dec form if d.Dec != nil
++	d infDecAmount
++	// s is the generated value of this quantity to avoid recalculation
++	s string
++
++	// Change Format at will. See the comment for Canonicalize for
++	// more details.
++	Format
++}
++
++// Format lists the three possible formattings of a quantity.
++type Format string
++
++const (
++	DecimalExponent = Format("DecimalExponent") // e.g., 12e6
++	BinarySI        = Format("BinarySI")        // e.g., 12Mi (12 * 2^20)
++	DecimalSI       = Format("DecimalSI")       // e.g., 12M  (12 * 10^6)
++)
++
++const (
++	// splitREString is used to separate a number from its suffix; as such,
++	// this is overly permissive, but that's OK-- it will be checked later.
++	splitREString = "^([+-]?[0-9.]+)([eEinumkKMGTP]*[-+]?[0-9]*)$"
++)
++
++var (
++	// Errors that could happen while parsing a string.
++	ErrFormatWrong = errors.New("quantities must match the regular expression '" + splitREString + "'")
++	ErrNumeric     = errors.New("unable to parse numeric part of quantity")
++	ErrSuffix      = errors.New("unable to parse quantity's suffix")
++)
++
++// parseQuantityString is a fast scanner for quantity values.
++func parseQuantityString(str string) (positive bool, value, num, denom, suffix string, err error) {
++	positive = true
++	pos := 0
++	end := len(str)
++
++	// handle leading sign
++	if pos < end {
++		switch str[0] {
++		case '-':
++			positive = false
++			pos++
++		case '+':
++			pos++
++		}
++	}
++
++	// strip leading zeros
++Zeroes:
++	for i := pos; ; i++ {
++		if i >= end {
++			num = "0"
++			value = num
++			return
++		}
++		switch str[i] {
++		case '0':
++			pos++
++		default:
++			break Zeroes
++		}
++	}
++
++	// extract the numerator
++Num:
++	for i := pos; ; i++ {
++		if i >= end {
++			num = str[pos:end]
++			value = str[0:end]
++			return
++		}
++		switch str[i] {
++		case '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
++		default:
++			num = str[pos:i]
++			pos = i
++			break Num
++		}
++	}
++
++	// if we stripped all numerator positions, always return 0
++	if len(num) == 0 {
++		num = "0"
++	}
++
++	// handle a denominator
++	if pos < end && str[pos] == '.' {
++		pos++
++	Denom:
++		for i := pos; ; i++ {
++			if i >= end {
++				denom = str[pos:end]
++				value = str[0:end]
++				return
++			}
++			switch str[i] {
++			case '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
++			default:
++				denom = str[pos:i]
++				pos = i
++				break Denom
++			}
++		}
++		// TODO: we currently allow 1.G, but we may not want to in the future.
++		// if len(denom) == 0 {
++		// 	err = ErrFormatWrong
++		// 	return
++		// }
++	}
++	value = str[0:pos]
++
++	// grab the elements of the suffix
++	suffixStart := pos
++	for i := pos; ; i++ {
++		if i >= end {
++			suffix = str[suffixStart:end]
++			return
++		}
++		if !strings.ContainsAny(str[i:i+1], "eEinumkKMGTP") {
++			pos = i
++			break
++		}
++	}
++	if pos < end {
++		switch str[pos] {
++		case '-', '+':
++			pos++
++		}
++	}
++Suffix:
++	for i := pos; ; i++ {
++		if i >= end {
++			suffix = str[suffixStart:end]
++			return
++		}
++		switch str[i] {
++		case '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
++		default:
++			break Suffix
++		}
++	}
++	// we encountered a non decimal in the Suffix loop, but the last character
++	// was not a valid exponent
++	err = ErrFormatWrong
++	return
++}
++
++// ParseQuantity turns str into a Quantity, or returns an error.
++func ParseQuantity(str string) (Quantity, error) {
++	if len(str) == 0 {
++		return Quantity{}, ErrFormatWrong
++	}
++	if str == "0" {
++		return Quantity{Format: DecimalSI, s: str}, nil
++	}
++
++	positive, value, num, denom, suf, err := parseQuantityString(str)
++	if err != nil {
++		return Quantity{}, err
++	}
++
++	base, exponent, format, ok := quantitySuffixer.interpret(suffix(suf))
++	if !ok {
++		return Quantity{}, ErrSuffix
++	}
++
++	precision := int32(0)
++	scale := int32(0)
++	mantissa := int64(1)
++	switch format {
++	case DecimalExponent, DecimalSI:
++		scale = exponent
++		precision = maxInt64Factors - int32(len(num)+len(denom))
++	case BinarySI:
++		scale = 0
++		switch {
++		case exponent >= 0 && len(denom) == 0:
++			// only handle positive binary numbers with the fast path
++			mantissa = int64(int64(mantissa) << uint64(exponent))
++			// 1Mi (2^20) has ~6 digits of decimal precision, so exponent*3/10 -1 is roughly the precision
++			precision = 15 - int32(len(num)) - int32(float32(exponent)*3/10) - 1
++		default:
++			precision = -1
++		}
++	}
++
++	if precision >= 0 {
++		// if we have a denominator, shift the entire value to the left by the number of places in the
++		// denominator
++		scale -= int32(len(denom))
++		if scale >= int32(Nano) {
++			shifted := num + denom
++
++			var value int64
++			value, err := strconv.ParseInt(shifted, 10, 64)
++			if err != nil {
++				return Quantity{}, ErrNumeric
++			}
++			if result, ok := int64Multiply(value, int64(mantissa)); ok {
++				if !positive {
++					result = -result
++				}
++				// if the number is in canonical form, reuse the string
++				switch format {
++				case BinarySI:
++					if exponent%10 == 0 && (value&0x07 != 0) {
++						return Quantity{i: int64Amount{value: result, scale: Scale(scale)}, Format: format, s: str}, nil
++					}
++				default:
++					if scale%3 == 0 && !strings.HasSuffix(shifted, "000") && shifted[0] != '0' {
++						return Quantity{i: int64Amount{value: result, scale: Scale(scale)}, Format: format, s: str}, nil
++					}
++				}
++				return Quantity{i: int64Amount{value: result, scale: Scale(scale)}, Format: format}, nil
++			}
++		}
++	}
++
++	amount := new(inf.Dec)
++	if _, ok := amount.SetString(value); !ok {
++		return Quantity{}, ErrNumeric
++	}
++
++	// So that no one but us has to think about suffixes, remove it.
++	if base == 10 {
++		amount.SetScale(amount.Scale() + Scale(exponent).infScale())
++	} else if base == 2 {
++		// numericSuffix = 2 ** exponent
++		numericSuffix := big.NewInt(1).Lsh(bigOne, uint(exponent))
++		ub := amount.UnscaledBig()
++		amount.SetUnscaledBig(ub.Mul(ub, numericSuffix))
++	}
++
++	// Cap at min/max bounds.
++	sign := amount.Sign()
++	if sign == -1 {
++		amount.Neg(amount)
++	}
++
++	// This rounds non-zero values up to the minimum representable value, under the theory that
++	// if you want some resources, you should get some resources, even if you asked for way too small
++	// of an amount.  Arguably, this should be inf.RoundHalfUp (normal rounding), but that would have
++	// the side effect of rounding values < .5n to zero.
++	if v, ok := amount.Unscaled(); v != int64(0) || !ok {
++		amount.Round(amount, Nano.infScale(), inf.RoundUp)
++	}
++
++	// The max is just a simple cap.
++	// TODO: this prevents accumulating quantities greater than int64, for instance quota across a cluster
++	if format == BinarySI && amount.Cmp(maxAllowed.Dec) > 0 {
++		amount.Set(maxAllowed.Dec)
++	}
++
++	if format == BinarySI && amount.Cmp(decOne) < 0 && amount.Cmp(decZero) > 0 {
++		// This avoids rounding and hopefully confusion, too.
++		format = DecimalSI
++	}
++	if sign == -1 {
++		amount.Neg(amount)
++	}
++
++	return Quantity{d: infDecAmount{amount}, Format: format}, nil
++}
++
++// Value returns the unscaled value of q rounded up to the nearest integer away from 0.
++func (q *Quantity) Value() int64 {
++	return q.ScaledValue(0)
++}
++
++// ScaledValue returns the value of ceil(q / 10^scale).
++// For example, NewQuantity(1, DecimalSI).ScaledValue(Milli) returns 1000.
++// This could overflow an int64.
++// To detect overflow, call Value() first and verify the expected magnitude.
++func (q *Quantity) ScaledValue(scale Scale) int64 {
++	if q.d.Dec == nil {
++		i, _ := q.i.AsScaledInt64(scale)
++		return i
++	}
++	dec := q.d.Dec
++	return scaledValue(dec.UnscaledBig(), int(dec.Scale()), int(scale.infScale()))
++}
+diff --git a/pkg/blockio/internal/resource/scale_int.go b/pkg/blockio/internal/resource/scale_int.go
+new file mode 100644
+index 0000000..55e177b
+--- /dev/null
++++ b/pkg/blockio/internal/resource/scale_int.go
+@@ -0,0 +1,95 @@
++/*
++Copyright 2015 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package resource
++
++import (
++	"math"
++	"math/big"
++	"sync"
++)
++
++var (
++	// A sync pool to reduce allocation.
++	intPool  sync.Pool
++	maxInt64 = big.NewInt(math.MaxInt64)
++)
++
++func init() {
++	intPool.New = func() interface{} {
++		return &big.Int{}
++	}
++}
++
++// scaledValue scales given unscaled value from scale to new Scale and returns
++// an int64. It ALWAYS rounds up the result when scale down. The final result might
++// overflow.
++//
++// scale, newScale represents the scale of the unscaled decimal.
++// The mathematical value of the decimal is unscaled * 10**(-scale).
++func scaledValue(unscaled *big.Int, scale, newScale int) int64 {
++	dif := scale - newScale
++	if dif == 0 {
++		return unscaled.Int64()
++	}
++
++	// Handle scale up
++	// This is an easy case, we do not need to care about rounding and overflow.
++	// If any intermediate operation causes overflow, the result will overflow.
++	if dif < 0 {
++		return unscaled.Int64() * int64(math.Pow10(-dif))
++	}
++
++	// Handle scale down
++	// We have to be careful about the intermediate operations.
++
++	// fast path when unscaled < max.Int64 and exp(10,dif) < max.Int64
++	const log10MaxInt64 = 19
++	if unscaled.Cmp(maxInt64) < 0 && dif < log10MaxInt64 {
++		divide := int64(math.Pow10(dif))
++		result := unscaled.Int64() / divide
++		mod := unscaled.Int64() % divide
++		if mod != 0 {
++			return result + 1
++		}
++		return result
++	}
++
++	// We should only convert back to int64 when getting the result.
++	divisor := intPool.Get().(*big.Int)
++	exp := intPool.Get().(*big.Int)
++	result := intPool.Get().(*big.Int)
++	defer func() {
++		intPool.Put(divisor)
++		intPool.Put(exp)
++		intPool.Put(result)
++	}()
++
++	// divisor = 10^(dif)
++	// TODO: create loop up table if exp costs too much.
++	divisor.Exp(bigTen, exp.SetInt64(int64(dif)), nil)
++	// reuse exp
++	remainder := exp
++
++	// result = unscaled / divisor
++	// remainder = unscaled % divisor
++	result.DivMod(unscaled, divisor, remainder)
++	if remainder.Sign() != 0 {
++		return result.Int64() + 1
++	}
++
++	return result.Int64()
++}
+diff --git a/pkg/blockio/internal/resource/suffix.go b/pkg/blockio/internal/resource/suffix.go
+new file mode 100644
+index 0000000..3bc1a4d
+--- /dev/null
++++ b/pkg/blockio/internal/resource/suffix.go
+@@ -0,0 +1,143 @@
++/*
++Copyright 2014 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package resource
++
++import (
++	"strconv"
++)
++
++type suffix string
++
++// suffixer can interpret and construct suffixes.
++type suffixer interface {
++	interpret(suffix) (base, exponent int32, fmt Format, ok bool)
++}
++
++// quantitySuffixer handles suffixes for all three formats that quantity
++// can handle.
++var quantitySuffixer = newSuffixer()
++
++type bePair struct {
++	base, exponent int32
++}
++
++type listSuffixer struct {
++	suffixToBE      map[suffix]bePair
++	beToSuffix      map[bePair]suffix
++	beToSuffixBytes map[bePair][]byte
++}
++
++func (ls *listSuffixer) addSuffix(s suffix, pair bePair) {
++	if ls.suffixToBE == nil {
++		ls.suffixToBE = map[suffix]bePair{}
++	}
++	if ls.beToSuffix == nil {
++		ls.beToSuffix = map[bePair]suffix{}
++	}
++	if ls.beToSuffixBytes == nil {
++		ls.beToSuffixBytes = map[bePair][]byte{}
++	}
++	ls.suffixToBE[s] = pair
++	ls.beToSuffix[pair] = s
++	ls.beToSuffixBytes[pair] = []byte(s)
++}
++
++func (ls *listSuffixer) lookup(s suffix) (base, exponent int32, ok bool) {
++	pair, ok := ls.suffixToBE[s]
++	if !ok {
++		return 0, 0, false
++	}
++	return pair.base, pair.exponent, true
++}
++
++type suffixHandler struct {
++	decSuffixes listSuffixer
++	binSuffixes listSuffixer
++}
++
++type fastLookup struct {
++	*suffixHandler
++}
++
++func (l fastLookup) interpret(s suffix) (base, exponent int32, format Format, ok bool) {
++	switch s {
++	case "":
++		return 10, 0, DecimalSI, true
++	case "n":
++		return 10, -9, DecimalSI, true
++	case "u":
++		return 10, -6, DecimalSI, true
++	case "m":
++		return 10, -3, DecimalSI, true
++	case "k":
++		return 10, 3, DecimalSI, true
++	case "M":
++		return 10, 6, DecimalSI, true
++	case "G":
++		return 10, 9, DecimalSI, true
++	}
++	return l.suffixHandler.interpret(s)
++}
++
++func newSuffixer() suffixer {
++	sh := &suffixHandler{}
++
++	// IMPORTANT: if you change this section you must change fastLookup
++
++	sh.binSuffixes.addSuffix("Ki", bePair{2, 10})
++	sh.binSuffixes.addSuffix("Mi", bePair{2, 20})
++	sh.binSuffixes.addSuffix("Gi", bePair{2, 30})
++	sh.binSuffixes.addSuffix("Ti", bePair{2, 40})
++	sh.binSuffixes.addSuffix("Pi", bePair{2, 50})
++	sh.binSuffixes.addSuffix("Ei", bePair{2, 60})
++	// Don't emit an error when trying to produce
++	// a suffix for 2^0.
++	sh.decSuffixes.addSuffix("", bePair{2, 0})
++
++	sh.decSuffixes.addSuffix("n", bePair{10, -9})
++	sh.decSuffixes.addSuffix("u", bePair{10, -6})
++	sh.decSuffixes.addSuffix("m", bePair{10, -3})
++	sh.decSuffixes.addSuffix("", bePair{10, 0})
++	sh.decSuffixes.addSuffix("k", bePair{10, 3})
++	sh.decSuffixes.addSuffix("M", bePair{10, 6})
++	sh.decSuffixes.addSuffix("G", bePair{10, 9})
++	sh.decSuffixes.addSuffix("T", bePair{10, 12})
++	sh.decSuffixes.addSuffix("P", bePair{10, 15})
++	sh.decSuffixes.addSuffix("E", bePair{10, 18})
++
++	return fastLookup{sh}
++}
++
++func (sh *suffixHandler) interpret(suffix suffix) (base, exponent int32, fmt Format, ok bool) {
++	// Try lookup tables first
++	if b, e, ok := sh.decSuffixes.lookup(suffix); ok {
++		return b, e, DecimalSI, true
++	}
++	if b, e, ok := sh.binSuffixes.lookup(suffix); ok {
++		return b, e, BinarySI, true
++	}
++
++	if len(suffix) > 1 && (suffix[0] == 'E' || suffix[0] == 'e') {
++		parsed, err := strconv.ParseInt(string(suffix[1:]), 10, 64)
++		if err != nil {
++			return 0, 0, DecimalExponent, false
++		}
++		return 10, int32(parsed), DecimalExponent, true
++	}
++
++	return 0, 0, DecimalExponent, false
++}
